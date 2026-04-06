@@ -1,0 +1,210 @@
+version: "3.8"
+
+# =============================================================================
+# CDC Pipeline: MySQL → Debezium → Kafka → NiFi → Data Warehouse
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Zookeeper — required by Kafka for cluster coordination
+  # ---------------------------------------------------------------------------
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: cdc_zookeeper
+    hostname: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo ruok | nc localhost 2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - cdc_net
+
+  # ---------------------------------------------------------------------------
+  # Kafka Broker — event streaming backbone
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: cdc_kafka
+    hostname: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"       # Internal (Docker network)
+      - "29092:29092"     # External (host machine)
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
+      # Two listeners: one for internal Docker use, one for host access
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      # Auto-create topics is enabled for convenience (disable in production)
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+    networks:
+      - cdc_net
+
+  # ---------------------------------------------------------------------------
+  # Kafka Connect + Debezium — CDC engine that reads MySQL binlog
+  # ---------------------------------------------------------------------------
+  kafka-connect:
+    image: debezium/connect:2.4
+    container_name: cdc_kafka_connect
+    hostname: kafka-connect
+    depends_on:
+      kafka:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+    ports:
+      - "8083:8083"   # Kafka Connect REST API
+    environment:
+      BOOTSTRAP_SERVERS: "kafka:9092"
+      GROUP_ID: "cdc-connect-group"
+      CONFIG_STORAGE_TOPIC: "cdc.connect.configs"
+      OFFSET_STORAGE_TOPIC: "cdc.connect.offsets"
+      STATUS_STORAGE_TOPIC: "cdc.connect.status"
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      # Converter format: JSON without schema (simpler for NiFi)
+      KEY_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8083/connectors"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+    networks:
+      - cdc_net
+
+  # ---------------------------------------------------------------------------
+  # MySQL — source database with binlog enabled
+  # ---------------------------------------------------------------------------
+  mysql:
+    image: mysql:8.0
+    container_name: cdc_mysql
+    hostname: mysql
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: testdb
+      MYSQL_USER: cdc_user
+      MYSQL_PASSWORD: cdc_password
+    volumes:
+      # Custom MySQL config enabling binlog
+      - ./mysql/my.cnf:/etc/mysql/conf.d/my.cnf:ro
+      # Initialization SQL script (runs once on first start)
+      - ./mysql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-prootpassword"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - cdc_net
+
+  # ---------------------------------------------------------------------------
+  # Data Warehouse — PostgreSQL target database
+  # ---------------------------------------------------------------------------
+  warehouse:
+    image: postgres:15
+    container_name: cdc_warehouse
+    hostname: warehouse
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: datawarehouse
+      POSTGRES_USER: dw_user
+      POSTGRES_PASSWORD: dw_password
+    volumes:
+      # DW schema initialization
+      - ./warehouse/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dw_user -d datawarehouse"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - cdc_net
+
+  # ---------------------------------------------------------------------------
+  # Apache NiFi — data flow processor (routes Kafka events to DW)
+  # ---------------------------------------------------------------------------
+  nifi:
+    image: apache/nifi:1.23.2
+    container_name: cdc_nifi
+    hostname: nifi
+    depends_on:
+      kafka:
+        condition: service_healthy
+      warehouse:
+        condition: service_healthy
+    ports:
+      - "8080:8080"   # NiFi UI (http://localhost:8080/nifi)
+    environment:
+      NIFI_WEB_HTTP_PORT: 8080
+      SINGLE_USER_CREDENTIALS_USERNAME: admin
+      SINGLE_USER_CREDENTIALS_PASSWORD: adminpassword123
+    volumes:
+      # Persist NiFi state across restarts
+      - nifi_conf:/opt/nifi/nifi-current/conf
+      - nifi_database_repository:/opt/nifi/nifi-current/database_repository
+      - nifi_flowfile_repository:/opt/nifi/nifi-current/flowfile_repository
+      - nifi_content_repository:/opt/nifi/nifi-current/content_repository
+      - nifi_provenance_repository:/opt/nifi/nifi-current/provenance_repository
+    networks:
+      - cdc_net
+
+  # ---------------------------------------------------------------------------
+  # Kafka UI — optional web UI to browse topics and messages
+  # ---------------------------------------------------------------------------
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: cdc_kafka_ui
+    depends_on:
+      - kafka
+    ports:
+      - "8090:8080"   # http://localhost:8090
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local-cdc
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: "kafka:9092"
+      KAFKA_CLUSTERS_0_ZOOKEEPER: "zookeeper:2181"
+    networks:
+      - cdc_net
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  cdc_net:
+    driver: bridge
+    name: cdc_network
+
+# =============================================================================
+# Named Volumes (for NiFi persistence)
+# =============================================================================
+volumes:
+  nifi_conf:
+  nifi_database_repository:
+  nifi_flowfile_repository:
+  nifi_content_repository:
+  nifi_provenance_repository:
