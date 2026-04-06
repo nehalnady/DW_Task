@@ -51,6 +51,32 @@ echo " Kafka Connect is ready!"
 echo "[5/5] Starting Apache NiFi..."
 docker compose up -d nifi
 
+# --- Step 6: Install PostgreSQL JDBC driver into NiFi --------------------
+JDBC_JAR="postgresql-42.7.3.jar"
+JDBC_URL="https://jdbc.postgresql.org/download/${JDBC_JAR}"
+
+echo ""
+echo "[6/6] Installing PostgreSQL JDBC driver into NiFi..."
+
+# Download only if not already cached locally
+if [ ! -f "/tmp/${JDBC_JAR}" ]; then
+    echo "    Downloading ${JDBC_JAR}..."
+    curl -fsSL -o "/tmp/${JDBC_JAR}" "${JDBC_URL}"
+else
+    echo "    Using cached /tmp/${JDBC_JAR}"
+fi
+
+# Wait briefly for NiFi container to be up enough to accept docker cp
+echo "    Waiting for NiFi container to be running..."
+until [ "$(docker inspect -f '{{.State.Running}}' cdc_nifi 2>/dev/null)" = "true" ]; do
+    printf "."
+    sleep 3
+done
+echo " NiFi container is running."
+
+docker cp "/tmp/${JDBC_JAR}" cdc_nifi:/opt/nifi/nifi-current/lib/
+echo "    ✅ JDBC driver installed at /opt/nifi/nifi-current/lib/${JDBC_JAR}"
+
 echo ""
 echo "============================================================"
 echo " All services started!"

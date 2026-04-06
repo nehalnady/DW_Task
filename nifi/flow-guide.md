@@ -13,6 +13,7 @@ from Kafka and writes them to the PostgreSQL data warehouse.
 - Kafka is running with the topic `cdc.testdb.users` populated by Debezium
 - PostgreSQL DW is running at `warehouse:5432`
 - Debezium connector is registered and running
+- PostgreSQL JDBC driver is present in the NiFi container (**automated** by `scripts/start.sh`)
 
 ---
 
@@ -25,37 +26,32 @@ from Kafka and writes them to the PostgreSQL data warehouse.
 [EvaluateJsonPath]  ← extract id, name, email, op, ts_ms
         |
         v
-[RouteOnAttribute]  ← branch on cdc_operation (c/u/d)
+[RouteOnAttribute]  ← branch on cdc_operation (c/u/d/r)
         |
-   +----|-------+----------+
-   v            v          v
-[PutSQL]    [PutSQL]   [PutSQL]
- INSERT      UPSERT     DELETE-mark
-        \       |       /
-         v      v      v
-       [LogAttribute]  (for debugging)
+   +----|-------+----------+----------+
+   v            v          v          v
+[PutSQL]    [PutSQL]   [PutSQL]  [PutSQL]
+ INSERT/     UPDATE     DELETE    SNAPSHOT
+ SNAPSHOT              -mark     (op=r)
+        \       |       |       /
+         v      v       v      v
+           [LogAttribute]  (for debugging)
 ```
 
 ---
 
-## Step 1 — Add PostgreSQL JDBC Driver to NiFi
+## Step 1 — PostgreSQL JDBC Driver (Automated)
 
-NiFi needs the PostgreSQL JDBC driver JAR to talk to the DW.
+The `scripts/start.sh` script **automatically** downloads the PostgreSQL JDBC driver
+and copies it into the NiFi container. No manual action is needed.
 
-1. Download PostgreSQL JDBC driver:
-   ```
-   wget https://jdbc.postgresql.org/download/postgresql-42.7.3.jar
-   ```
+If you ever need to do this manually:
 
-2. Copy it into the NiFi container:
-   ```bash
-   docker cp postgresql-42.7.3.jar cdc_nifi:/opt/nifi/nifi-current/lib/
-   ```
-
-3. Restart NiFi (or use the UI — NiFi hot-loads JARs in `/lib`):
-   ```bash
-   docker restart cdc_nifi
-   ```
+```bash
+wget https://jdbc.postgresql.org/download/postgresql-42.7.3.jar
+docker cp postgresql-42.7.3.jar cdc_nifi:/opt/nifi/nifi-current/lib/
+docker restart cdc_nifi
+```
 
 ---
 
@@ -148,14 +144,16 @@ Routes FlowFiles to different SQL processors based on the CDC operation type.
 
 **Add these properties:**
 
-| Route Name | Value |
-|---|---|
-| `insert` | `${cdc_operation:equals('c')}` |
-| `update` | `${cdc_operation:equals('u')}` |
-| `delete` | `${cdc_operation:equals('d')}` |
+| Route Name | Value | Description |
+|---|---|---|
+| `insert` | `${cdc_operation:equals('c')}` | New rows |
+| `update` | `${cdc_operation:equals('u')}` | Changed rows |
+| `delete` | `${cdc_operation:equals('d')}` | Deleted rows |
+| `snapshot` | `${cdc_operation:equals('r')}` | Initial snapshot rows from Debezium |
 
 **Relationships:**
 - `insert` → PutSQL (Insert processor)
+- `snapshot` → PutSQL (Insert processor) ← **same processor as `insert`**
 - `update` → PutSQL (Upsert processor)
 - `delete` → PutSQL (Delete-mark processor)
 - `unmatched` → LogAttribute
@@ -180,12 +178,16 @@ VALUES (
     ${cdc_id},
     '${cdc_name}',
     '${cdc_email}',
-    TO_TIMESTAMP(${cdc_created_at:isEmpty():ifElse('0', cdc_created_at)}::BIGINT / 1000),
-    TO_TIMESTAMP(${cdc_updated_at:isEmpty():ifElse('0', cdc_updated_at)}::BIGINT / 1000),
+    NULLIF('${cdc_created_at}', '')::TIMESTAMP,
+    NULLIF('${cdc_updated_at}', '')::TIMESTAMP,
     '${cdc_operation}',
     ${cdc_timestamp}
 )
 ```
+
+> **Note:** Debezium emits `created_at` / `updated_at` as ISO 8601 strings
+> (e.g. `"2024-01-01T10:00:00Z"`), not as numeric epoch values.
+> `NULLIF(..., '')` safely handles empty strings as SQL `NULL`.
 
 **Relationships:**
 - `success` → LogAttribute (or terminate)
@@ -211,8 +213,8 @@ VALUES (
     ${cdc_id},
     '${cdc_name}',
     '${cdc_email}',
-    TO_TIMESTAMP(${cdc_created_at:isEmpty():ifElse('0', cdc_created_at)}::BIGINT / 1000),
-    TO_TIMESTAMP(${cdc_updated_at:isEmpty():ifElse('0', cdc_updated_at)}::BIGINT / 1000),
+    NULLIF('${cdc_created_at}', '')::TIMESTAMP,
+    NULLIF('${cdc_updated_at}', '')::TIMESTAMP,
     '${cdc_operation}',
     ${cdc_timestamp}
 )
@@ -232,14 +234,20 @@ Soft-marks deleted records (`op = d`) by inserting a tombstone row.
 INSERT INTO dw_users (id, name, email, created_at, updated_at, cdc_operation, cdc_timestamp)
 VALUES (
     ${cdc_id},
-    '${cdc_name:isEmpty():ifElse(NULL, cdc_name)}',
-    '${cdc_email:isEmpty():ifElse(NULL, cdc_email)}',
+    NULLIF('${cdc_name}', ''),
+    NULLIF('${cdc_email}', ''),
     NULL,
     NULL,
     'd',
     ${cdc_timestamp}
 )
 ```
+
+> **Why `NULLIF` instead of NiFi EL `ifElse(NULL, ...)`?**
+> NiFi Expression Language cannot produce a SQL `NULL` literal via string interpolation.
+> `NULLIF('${cdc_name}', '')` is evaluated by PostgreSQL — if the value is an empty
+> string (which is what Debezium sends for missing fields on deletes), PostgreSQL
+> returns `NULL`.
 
 ---
 
